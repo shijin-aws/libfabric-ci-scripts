@@ -125,7 +125,7 @@ define_subnets() {
             --query "Subnets[*].SubnetId" --output=text)
     elif [[ "${AWS_DEFAULT_REGION}" == 'us-east-1' ]]; then
         subnet_ids=$(aws ec2 describe-subnets \
-            --filters "Name=availability-zone,Values=[us-east-1a,us-east-1d]" \
+            --filters "Name=availability-zone,Values=[us-east-1a,us-east-1b]" \
             "Name=vpc-id,Values=$vpc_id" \
             --query "Subnets[*].SubnetId" --output=text)
     else
@@ -181,7 +181,7 @@ create_instance() {
                     --query "Instances[*].InstanceId" \
                     --output=text ${addl_args} 2>&1)
             create_instance_exit_code=$?
-            echo ${INSTANCE_IDS}
+            echo "${INSTANCE_IDS}"
             set -e
             # If run-instances is successful break from both the loops, else
             # find out whether the error was due to SERVER_ERROR or some other error
@@ -221,31 +221,34 @@ prepare_instance() {
         num_instances=$2
         INSTANCES=()
         create_pg
-        while [ ${num_instances} -gt 0 ] ; do
-            create_instance_attempts=0
-            INSTANCE_STATE="unavailable"
-            while [ ${INSTANCE_STATE} != 'running' ] && [ ${create_instance_attempts} -lt ${create_instance_retries} ] ; do
-                if [ $1 == 'ami_instance' ] ; then
-                    create_instance ${SSHSG} 1 ${prep_ami} ${instance_ami_type}
-                else
-                    create_instance ${SGId} 1 ${AMIS["${AWS_DEFAULT_REGION}"]} ${instance_test_type}
-                fi
-                if [ ${create_instance_exit_code} -ne 0 ]; then
-                    echo "==> Changing the region"
-                    # Start over with new region
-                    continue 3
-                else
-                    test_instance_status ${INSTANCE_IDS}
-                fi
+        create_instance_attempts=0
+        INSTANCE_STATE="unavailable"
+        while [ ${INSTANCE_STATE} != 'running' ] && [ ${create_instance_attempts} -lt ${create_instance_retries} ] ; do
+            if [ $1 == 'ami_instance' ] ; then
+                create_instance ${SSHSG} 1 ${prep_ami} ${instance_ami_type}
+            else
+                create_instance ${SGId} ${num_instances} ${AMIS["${AWS_DEFAULT_REGION}"]} ${instance_test_type}
+            fi
+            if [ ${create_instance_exit_code} -ne 0 ]; then
+                echo "==> Changing the region"
+                # Start over with new region
+                continue 3
+            else
+                INSTANCES=(${INSTANCE_IDS})
+                for INSTANCE_ID in ${INSTANCES[@]};do
+                    test_instance_status $INSTANCE_ID
+                    if [ ${INSTANCE_STATE} != "running" ]; then
+                        terminate_instances
+                        break
+                    fi
+                done
+            fi
                 create_instance_attempts=$((create_instance_attempts+1))
-            done
+        done
             if [ ${INSTANCE_STATE} != 'running' ] ; then
                 echo "All attempts to create instance failed."
                 exit 1
             fi
-            INSTANCES+=(${INSTANCE_IDS})
-            num_instances=$((num_instances-1))
-        done
         break
     done
 }
@@ -287,7 +290,7 @@ test_ssh() {
     while [ $host_ready -ne 0 ] && [ $host_poll_count -lt ${ssh_check_retries} ] ; do
         echo "Waiting for host instance to become ready"
         sleep 5
-        ssh -T -o ConnectTimeout=30 -o StrictHostKeyChecking=no -o BatchMode=yes \
+        ssh -T -o ConnectTimeout=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
             -i "~/${slave_keypair}" ${ssh_user}@${PublicDNS}  hostname
 
         if [ $? -eq 0 ]; then
@@ -321,7 +324,7 @@ prepare_ami() {
 EOF
 
     cat $WORKSPACE/libfabric-ci-scripts/nccl/common/prep_ami.sh >> ${tmp_script}
-    ssh -T -o ConnectTimeout=30 -o StrictHostKeyChecking=no -o BatchMode=yes \
+    ssh -T -o ConnectTimeout=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
         -i "~/${slave_keypair}" ${ssh_user}@${PublicDNS} "bash -s" < ${tmp_script}
 }
 
@@ -470,7 +473,7 @@ EOF
     set -e
     nvidia-smi -q | head
 EOF
-    ssh -T -o ConnectTimeout=30 -o StrictHostKeyChecking=no -o BatchMode=yes \
+    ssh -T -o ConnectTimeout=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
         -i "~/${slave_keypair}" ${ssh_user}@$1 "bash -s" < ${tmp_script}
 }
 

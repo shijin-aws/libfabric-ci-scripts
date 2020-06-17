@@ -7,7 +7,7 @@ tmp_script=${tmp_script:-$(mktemp -p $WORKSPACE)}
 # Disable IMPI tests for now until apt/yum repo issues are addressed.
 RUN_IMPI_TESTS=${RUN_IMPI_TESTS:-0}
 ENABLE_PLACEMENT_GROUP=${ENABLE_PLACEMENT_GROUP:-0}
-
+TEST_SKIP_KMOD=${TEST_SKIP_KMOD:-0}
 get_alinux_ami_id() {
     region=$1
     aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2 \
@@ -61,6 +61,15 @@ get_rhel77_ami_id() {
     region=$1
     aws ec2 describe-images --owners 309956199498 \
         --filters 'Name=name,Values=RHEL-7.7_HVM_GA*' \
+        'Name=state,Values=available' 'Name=ena-support,Values=true' \
+        --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
+    return $?
+}
+
+get_rhel78_ami_id() {
+    region=$1
+    aws ec2 describe-images --owners 309956199498 \
+        --filters 'Name=name,Values=RHEL-7.8_HVM_GA*' \
         'Name=state,Values=available' 'Name=ena-support,Values=true' \
         --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
     return $?
@@ -216,6 +225,17 @@ script_builder()
         efa_software_components
     fi
 
+    # The libfabric shm provider use CMA for communication. By default ubuntu
+    # disallows non-child process ptrace by, which disable CMA.
+    # Since libfabric 1.10, shm provider has a fallback solution, which will
+    # be used when CMA is not available. Therefore, we turn off ptrace protection
+    # for v1.9.x and v1.8.x
+    if [ ${label} == "ubuntu" ]; then
+        if [ ${TARGET_BRANCH} == "v1.9.x" ] || [ ${TARGET_BRANCH} == "v1.8.x" ];then
+            echo "sudo sysctl -w kernel.yama.ptrace_scope=0" >> ${tmp_script}
+        fi
+    fi
+
     ${label}_install_deps
     if [ -n "$LIBFABRIC_INSTALL_PATH" ]; then
         echo "LIBFABRIC_INSTALL_PATH=$LIBFABRIC_INSTALL_PATH" >> ${tmp_script}
@@ -345,10 +365,15 @@ efa_software_components()
     cat <<-"EOF" >> ${tmp_script}
     tar -xf efa-installer.tar.gz
     cd ${HOME}/aws-efa-installer
-    sudo ./efa_installer.sh -y
-    . /etc/profile.d/efa.sh
-    echo "huge pages: $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)"
 EOF
+    if [ $TEST_SKIP_KMOD -eq 1 ]; then
+        echo "sudo ./efa_installer.sh -y -k" >> ${tmp_script}
+        #efa installer v 1.8.4 unloads efa module
+        echo "sudo modprobe efa" >> ${tmp_script}
+    else
+        echo "sudo ./efa_installer.sh -y" >> ${tmp_script}
+    fi
+    echo ". /etc/profile.d/efa.sh" >> ${tmp_script}
 }
 
 ubuntu_kernel_upgrade()

@@ -32,6 +32,9 @@ fi
 # Locking NCCL version to 2.5.7-1
 NCCL_2_5_7='3701130b3c1bcdb01c14b3cb70fe52498c1e82b7'
 
+# the last good commit before latest merge which breaks nccl-tests make
+NCCL_TEST_COMMIT='af4fa0f4cf7c2c3db0540da7ac8d6efc1d526635'
+
 # Identify latest CUDA on server
 latest_cuda=$(find /usr/local -maxdepth 1 -type d -iname "cuda*" | sort -V -r | head -1)
 echo "==> Latest CUDA: ${latest_cuda}"
@@ -137,14 +140,15 @@ install_nccl_tests() {
     cd $HOME
     sudo rm -rf nccl-tests
     git clone https://github.com/NVIDIA/nccl-tests.git && cd nccl-tests
-    make MPI=1 MPI_HOME=$HOME/anaconda3 NCCL_HOME=$HOME/nccl/build CUDA_HOME=${latest_cuda}
+    git checkout ${NCCL_TEST_COMMIT}
+    make MPI=1 MPI_HOME=/opt/amazon/openmpi NCCL_HOME=$HOME/nccl/build CUDA_HOME=${latest_cuda}
 }
 
 install_aws_ofi_nccl_plugin() {
     cd $HOME/aws-ofi-nccl
     ./autogen.sh
     ./configure --prefix=$HOME/aws-ofi-nccl/install \
-                --with-mpi=$HOME/anaconda3 \
+                --with-mpi=/opt/amazon/openmpi \
                 --with-libfabric=$HOME/libfabric/install \
                 --with-nccl=$HOME/nccl/build \
                 --with-cuda=${latest_cuda}
@@ -216,8 +220,12 @@ case $PLATFORM_ID in
         install_software
         ;;
     ubuntu)
-        # Wait for initialization to complete
-        sleep 100
+        # Wait until lock /var/lib/dpkg/lock-frontend released
+        sleep 300
+        # Building aws-ofi-nccl plugin with openmpi throws the following error:
+        # /usr/bin/ld: cannot find -ludev
+        # Installing libudev-dev mitigates the issue
+        sudo apt-get install -y libudev-dev
         install_software
         ;;
     *)

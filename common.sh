@@ -102,6 +102,23 @@ delete_pg()
 # Launches EC2 instances.
 create_instance()
 {
+    # TODO: the labels need to be fixed in LibfabricCI and the stack
+    # redeployed for PR testing
+    if [[ $PULL_REQUEST_REF == *pr* ]]; then
+        case "${label}" in
+            rhel)
+                ami[0]=$(get_rhel76_ami_id $AWS_DEFAULT_REGION)
+                ;;
+            ubuntu)
+                ami[0]=$(get_ubuntu_1804_ami_id $AWS_DEFAULT_REGION)
+                ;;
+            alinux)
+                ami[0]=$(get_alinux2_ami_id $AWS_DEFAULT_REGION)
+                ;;
+            *)
+                exit 1
+        esac
+    fi
     # If a specific subnet ID is provided by the caller, use that instead of
     # querying the VPC for all subnets.
     if [[ -n ${BUILD_SUBNET_ID} ]]; then
@@ -223,9 +240,7 @@ script_builder()
     type=$1
     set_var
     ${label}_update
-    if [ ${PROVIDER} == "efa" ]; then
-        efa_software_components
-    fi
+    efa_software_components
 
     # The libfabric shm provider use CMA for communication. By default ubuntu
     # disallows non-child process ptrace by, which disable CMA.
@@ -360,9 +375,9 @@ efa_software_components()
 {
     if [ -z "$EFA_INSTALLER_URL" ]; then
         if [ ${TARGET_BRANCH} == "v1.8.x" ]; then
-            EFA_INSTALLER_URL="https://s3-us-west-2.amazonaws.com/aws-efa-installer/aws-efa-installer-1.7.1.tar.gz"
+            EFA_INSTALLER_URL="https://efa-installer.amazonaws.com/aws-efa-installer-1.7.1.tar.gz"
         else
-            EFA_INSTALLER_URL="https://s3-us-west-2.amazonaws.com/aws-efa-installer/aws-efa-installer-latest.tar.gz"
+            EFA_INSTALLER_URL="https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz"
         fi
     fi
     echo "curl ${CURL_OPT} -o efa-installer.tar.gz $EFA_INSTALLER_URL" >> ${tmp_script}

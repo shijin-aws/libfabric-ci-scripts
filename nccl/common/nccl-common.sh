@@ -25,16 +25,20 @@ latest_cuda='$(find /usr/local -maxdepth 1 -type d -iname "cuda*" | sort -V -r |
 
 nvidia_driver_path='http://us.download.nvidia.com/tesla/440.33.01/NVIDIA-Linux-x86_64-440.33.01.run'
 
-# LD_LIBRARY_PATH for nccl tests
-custom_ld_library_path='$HOME/anaconda3/lib/:$HOME/aws-ofi-nccl/install/lib/:`
-                        `$HOME/nccl/build/lib:${latest_cuda}:`
-                        `$HOME/libfabric/install/lib/:`
-                        `$HOME/rdma-core/build/lib/:$LD_LIBRARY_PATH'
-
 set_jenkins_variables() {
 
     tmp_script=${tmp_script:-$(mktemp -p $WORKSPACE)}
     tmp_out=${tmp_out:-$(mktemp -p $WORKSPACE)}
+}
+
+find_latest_ami() {
+
+    ami=$(aws ec2 describe-images --owners amazon --filters \
+        "Name=name,Values=*$1*" \
+        "Name=state,Values=available" "Name=architecture,Values="x86_64"" \
+        --query 'reverse(sort_by(Images, &CreationDate)[].ImageId)' \
+        --output text | awk '{print $1;}')
+    echo ${ami}
 }
 
 set_aws_defaults() {
@@ -45,24 +49,18 @@ set_aws_defaults() {
     #Use default vpc_id for each region
     export vpc_id_reg=$(aws ec2 describe-vpcs --query "Vpcs[*].VpcId" --filters Name=isDefault,Values=true --output=text)
 
-    # The latest Deep Learning AMI (Amazon Linux 2) Image
-    ami_amzn=$(aws ec2 describe-images --owners amazon --filters \
-                "Name=name,Values=*Deep Learning AMI (Amazon Linux 2)*" \
-                "Name=state,Values=available" "Name=architecture,Values="x86_64"" \
-                --query 'reverse(sort_by(Images, &CreationDate)[].ImageId)' \
-                --output text | awk '{print $1;}')
 
+    # The latest Deep Learning AMI (Amazon Linux 2) Image
+    ami_amzn=$(find_latest_ami "Deep Learning AMI (Amazon Linux 2)")
     echo "==> Latest Deep Learning AMI (Amazon Linux): ${ami_amzn}"
 
-    # The latest Deep Learning AMI Ubuntu Image
-    ami_ubuntu=$(aws ec2 describe-images --owners amazon --filters \
-                "Name=name,Values=*Deep Learning AMI (Ubuntu 18.04)*" \
-                "Name=state,Values=available" \
-                "Name=architecture,Values="x86_64"" \
-                --query 'reverse(sort_by(Images, &CreationDate)[].ImageId)' \
-                --output text | awk '{print $1;}')
+    # The latest Deep Learning AMI Ubuntu 16.04 Image
+    ami_ubuntu_16_04=$(find_latest_ami "Deep Learning AMI (Ubuntu 16.04)")
+    echo "==> Latest Deep Learning AMI (Ubuntu 16.04): ${ami_ubuntu_16_04}"
 
-    echo "==> Latest Deep Learning AMI (Ubuntu): ${ami_ubuntu}"
+    # The latest Deep Learning AMI Ubuntu 18.04 Image
+    ami_ubuntu_18_04=$(find_latest_ami "Deep Learning AMI (Ubuntu 18.04)")
+    echo "==> Latest Deep Learning AMI (Ubuntu 18.04): ${ami_ubuntu_18_04}"
 }
 
 define_parameters() {
@@ -81,13 +79,19 @@ define_parameters() {
     if [[ "${label}" == 'alinux' ]]; then
         ssh_user='ec2-user'
         prep_ami=${ami_amzn}
-    else
+    elif [[ "${label}" == 'ubuntu_16.04' ]]; then
         ssh_user='ubuntu'
-        prep_ami=${ami_ubuntu}
+        prep_ami=${ami_ubuntu_16_04}
+    elif [[ "${label}" == 'ubuntu_18.04' ]]; then
+        ssh_user='ubuntu'
+        prep_ami=${ami_ubuntu_18_04}
+    else
+        echo "Unknown label"
+        exit 1
     fi
 }
 
-# Create security group for NCCL testing restricted egress
+# Create security group for NCCL testing
 create_efa_sg() {
 
     SGId=$(aws ec2 create-security-group --group-name "EFA-enabled-sg-$(get_uniq_num)" \
@@ -100,23 +104,11 @@ create_efa_sg() {
         --tags Key=Workspace,Value="${WORKSPACE}" Key=Build_Number,Value="${BUILD_NUMBER}"
 }
 
-# Create security group for custom AMI preparation unrestricted egress
-create_ssh_sg() {
-
-    SSHSG=$(aws ec2 create-security-group --group-name "ssh-group-$(get_uniq_num)" \
-        --description "allow ssh to host" --vpc-id ${vpc_id_reg} --query "GroupId" --output=text)
-    echo "==> Setting rules for ssh sg ${SSHSG}"
-    aws ec2 authorize-security-group-ingress --port 22 --cidr 0.0.0.0/0 \
-        --protocol tcp --group-id ${SSHSG}
-    aws ec2 create-tags --resources ${SSHSG} \
-        --tags Key=Workspace,Value="${WORKSPACE}" Key=Build_Number,Value="${BUILD_NUMBER}"
-}
-
 define_subnets() {
 
     # Get a list of subnets within the VPC relevant to the SG
     vpc_id=$(aws ec2 describe-security-groups \
-        --group-ids ${SSHSG} \
+        --group-ids ${SGId} \
         --query SecurityGroups[0].VpcId --output=text)
     if [[ "${AWS_DEFAULT_REGION}" == 'us-west-2' ]]; then
         subnet_ids=$(aws ec2 describe-subnets \
@@ -140,7 +132,6 @@ custom_instance_preparation() {
 
     define_parameters
     create_efa_sg
-    create_ssh_sg
     define_subnets
 }
 
@@ -225,7 +216,7 @@ prepare_instance() {
         INSTANCE_STATE="unavailable"
         while [ ${INSTANCE_STATE} != 'running' ] && [ ${create_instance_attempts} -lt ${create_instance_retries} ] ; do
             if [ $1 == 'ami_instance' ] ; then
-                create_instance ${SSHSG} 1 ${prep_ami} ${instance_ami_type}
+                create_instance ${SGId} 1 ${prep_ami} ${instance_ami_type}
             else
                 create_instance ${SGId} ${num_instances} ${AMIS["${AWS_DEFAULT_REGION}"]} ${instance_test_type}
             fi
@@ -483,7 +474,6 @@ generate_unit_tests_script_single_node() {
     #!/bin/bash
     PROVIDER="${PROVIDER}"
     latest_cuda="${latest_cuda}"
-    custom_ld_library_path="${custom_ld_library_path}"
 EOF
 
     cat <<-"EOF" >> ${tmp_script}
@@ -494,24 +484,21 @@ EOF
         set -xe
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x LD_LIBRARY_PATH="${custom_ld_library_path}" \
             --mca btl tcp,self --mca btl_tcp_if_exclude  lo,docker0 \
             --bind-to none ~/aws-ofi-nccl/install/bin/nccl_connection
 
         echo "==> Running ring unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 3 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x LD_LIBRARY_PATH="${custom_ld_library_path}" \
             --mca btl tcp,self --mca btl_tcp_if_exclude  lo,docker0 \
             --bind-to none ~/aws-ofi-nccl/install/bin/ring
 
         echo "==> Running nccl_message_transfer unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x LD_LIBRARY_PATH="${custom_ld_library_path}" \
             --mca btl tcp,self --mca btl_tcp_if_exclude  lo,docker0 \
             --bind-to none ~/aws-ofi-nccl/install/bin/nccl_message_transfer
-        set +xe
+        set +x
         break
     done
 EOF
@@ -523,7 +510,6 @@ generate_unit_tests_script_multi_node() {
     #!/bin/bash
     PROVIDER="${PROVIDER}"
     latest_cuda="${latest_cuda}"
-    custom_ld_library_path="${custom_ld_library_path}"
 EOF
 
     cat <<-"EOF" >> ${tmp_script}
@@ -534,24 +520,21 @@ EOF
         set -xe
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 -N 1 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x LD_LIBRARY_PATH="${custom_ld_library_path}" \
             --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
             --bind-to none --tag-output --hostfile hosts ~/aws-ofi-nccl/install/bin/nccl_connection
 
         echo "==> Running ring unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 3 -N 1 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x LD_LIBRARY_PATH="${custom_ld_library_path}" \
             --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
             --bind-to none --tag-output --hostfile hosts ~/aws-ofi-nccl/install/bin/ring
 
         echo "==> Running nccl_message_transfer unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 -N 1 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x LD_LIBRARY_PATH="${custom_ld_library_path}" \
             --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
             --bind-to none --tag-output --hostfile hosts ~/aws-ofi-nccl/install/bin/nccl_message_transfer
-        set +xe
+        set +x
         break
     done
 EOF
@@ -564,7 +547,6 @@ generate_nccl_test_script() {
     PROVIDER="${PROVIDER}"
     NUM_GPUS=$1
     latest_cuda="${latest_cuda}"
-    custom_ld_library_path="${custom_ld_library_path}"
 EOF
     cat <<-"EOF" >> ${tmp_script}
     echo "Executing NCCL test.."
@@ -574,7 +556,6 @@ EOF
     set -xe
     timeout 30m /opt/amazon/openmpi/bin/mpirun \
         -x FI_PROVIDER="$PROVIDER" \
-        -x LD_LIBRARY_PATH="${custom_ld_library_path}" \
         -x NCCL_ALGO=ring --hostfile $HOME/hosts \
         -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
         -x FI_EFA_TX_MIN_CREDITS=64 \
@@ -583,7 +564,7 @@ EOF
         -n $NUM_GPUS -N 8 \
         --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
         --bind-to none $HOME/nccl-tests/build/all_reduce_perf -b 8 -e 1G -f 2 -g 1 -c 1 -n 100
-    set +xe
+    set +x
 EOF
 }
 

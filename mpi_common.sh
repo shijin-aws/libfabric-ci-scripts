@@ -42,8 +42,18 @@ function ompi_setup {
     # doesn't load .bashrc/.bash_profile for non-interactive shells.
     export MPI_ARGS="-x LD_LIBRARY_PATH"
     if [ $ARCH = "x86_64" ]; then
-        # Only load the OFI component in MTL so MPI will fail if it cannot be used.
+        # Only load the OFI component in MTL so MPI will fail if it cannot
+        # be used.
         export MPI_ARGS="$MPI_ARGS --mca pml cm --mca mtl ofi"
+
+        # We have to disable the OpenIB BTL to avoid the call to ibv_fork_init
+        # EFA installer 1.10.0 (and above) ships open mpi that does not have openib btl
+        # enabled, therefore does not need the extra mca parameter
+        cur_version=$(head -n 1 /opt/amazon/efa_installed_packages | awk '{print $5}')
+        min_version=$(echo -e "$cur_version\n1.10.0" | sort --version-sort | head -n 1)
+        if [ $min_version != "1.10.0" ]; then
+            MPI_ARGS="$MPI_ARGS --mca btl ^openib"
+        fi
     else
         # Only load the TCP component in BTL so MPI will fail if it cannot be used.
         export MPI_ARGS="$MPI_ARGS --mca pml ob1 --mca btl tcp,self"

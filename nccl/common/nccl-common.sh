@@ -95,13 +95,12 @@ define_parameters() {
 create_efa_sg() {
 
     SGId=$(aws ec2 create-security-group --group-name "EFA-enabled-sg-$(get_uniq_num)" \
+        --tag-specification "ResourceType=security-group,Tags=[{Key=Workspace,Value="${WORKSPACE}"},{Key=Build_Number,Value="${BUILD_NUMBER}"}]" \
         --description "EFA-enabled security group" --vpc-id ${vpc_id_reg} --query "GroupId" --output=text)
     echo "==> Setting rules for efa sg ${SGId}"
     aws ec2 authorize-security-group-egress --group-id ${SGId} --protocol all --source-group ${SGId}
     aws ec2 authorize-security-group-ingress --group-id ${SGId} --protocol all --source-group ${SGId}
     aws ec2 authorize-security-group-ingress --port 22 --cidr 0.0.0.0/0 --protocol tcp --group-id ${SGId}
-    aws ec2 create-tags --resources ${SGId} \
-        --tags Key=Workspace,Value="${WORKSPACE}" Key=Build_Number,Value="${BUILD_NUMBER}"
 }
 
 define_subnets() {
@@ -222,6 +221,7 @@ prepare_instance() {
             fi
             if [ ${create_instance_exit_code} -ne 0 ]; then
                 echo "==> Changing the region"
+                delete_pg
                 # Start over with new region
                 continue 3
             else
@@ -358,7 +358,7 @@ create_ami() {
 
     echo "==> Create custom AMI"
     CUSTOM_AMI=$(aws ec2 create-image --instance-id $1 --name "nccl-enabled-ami-$(get_uniq_num)" \
-        --description "EFA and NCCL-enabled AMI" --output=text --query 'ImageId')
+        --description "${WORKSPACE}_${BUILD_NUMBER}" --output=text --query 'ImageId')
 
     echo "==> Wait for image ${CUSTOM_AMI} to become available"
     test_ami_status ${CUSTOM_AMI} ${AWS_DEFAULT_REGION}
@@ -374,7 +374,10 @@ deregister_ami() {
 
     echo "==> Deregistering AMIs"
     for region in ${!AMIS[@]}; do
+        snapshot=$(aws ec2 describe-images --image-ids ${AMIS[${region}]} --region ${region} --query "Images[*].BlockDeviceMappings[*].Ebs.SnapshotId" --output text)
         aws ec2 deregister-image --image-id ${AMIS[${region}]} --region ${region}
+        echo "==> Deleting snapshot"
+        aws ec2 delete-snapshot --snapshot-id ${snapshot} --region ${region}
     done
 }
 
@@ -410,9 +413,11 @@ create_pg() {
     # PG is tied to it and cannot be used in different AZs
     for subnet in ${subnet_ids[@]}; do
         PLACEMENT_GROUP="placement-group-$(get_uniq_num)"
-            aws ec2 create-placement-group \
+            placement_group_id=$(aws ec2 create-placement-group \
                 --group-name ${PLACEMENT_GROUP} \
-                --strategy cluster
+                --strategy cluster \
+                --tag-specification "ResourceType=placement-group,Tags=[{Key=Workspace,Value="${WORKSPACE}"},{Key=Build_Number,Value="${BUILD_NUMBER}"}]" \
+                --output=text --query 'PlacementGroup.GroupId')
             if [ $? -eq 0 ]; then
                 echo "Placement group: ${PLACEMENT_GROUP} created."
             fi
@@ -422,6 +427,7 @@ create_pg() {
 
 delete_pg() {
 
+    echo "==> Removing placement groups"
     for placement_group in ${PGS[@]}; do
         if [ -z ${placement_group} ]; then
             echo "Placement group: ${placement_group} does not exist."
@@ -429,6 +435,10 @@ delete_pg() {
         fi
         echo "==> Removing placement group: ${placement_group}"
         aws ec2 delete-placement-group --group-name ${placement_group}
+    done
+    # clearing the PGs dict
+    for key in ${!PGS[@]}; do
+        unset PGS["${key}"]
     done
 }
 
@@ -484,21 +494,21 @@ EOF
         set -xe
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x RDMAV_FORK_SAFE=1 \
+            -x RDMAV_FORK_SAFE=1 --mca pml ^cm \
             --mca btl tcp,self --mca btl_tcp_if_exclude  lo,docker0 \
             --bind-to none ~/aws-ofi-nccl/install/bin/nccl_connection
 
         echo "==> Running ring unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 3 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x RDMAV_FORK_SAFE=1 \
+            -x RDMAV_FORK_SAFE=1 --mca pml ^cm \
             --mca btl tcp,self --mca btl_tcp_if_exclude  lo,docker0 \
             --bind-to none ~/aws-ofi-nccl/install/bin/ring
 
         echo "==> Running nccl_message_transfer unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x RDMAV_FORK_SAFE=1 \
+            -x RDMAV_FORK_SAFE=1 --mca pml ^cm \
             --mca btl tcp,self --mca btl_tcp_if_exclude  lo,docker0 \
             --bind-to none ~/aws-ofi-nccl/install/bin/nccl_message_transfer
         set +x
@@ -523,21 +533,21 @@ EOF
         set -xe
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 -N 1 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x RDMAV_FORK_SAFE=1 \
+            -x RDMAV_FORK_SAFE=1 --mca pml ^cm \
             --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
             --bind-to none --tag-output --hostfile hosts ~/aws-ofi-nccl/install/bin/nccl_connection
 
         echo "==> Running ring unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 3 -N 1 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x RDMAV_FORK_SAFE=1 \
+            -x RDMAV_FORK_SAFE=1 --mca pml ^cm \
             --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
             --bind-to none --tag-output --hostfile hosts ~/aws-ofi-nccl/install/bin/ring
 
         echo "==> Running nccl_message_transfer unit test"
         timeout 5m /opt/amazon/openmpi/bin/mpirun -n 2 -N 1 \
             -x FI_PROVIDER="$PROVIDER" -x FI_EFA_ENABLE_SHM_TRANSFER=0 \
-            -x RDMAV_FORK_SAFE=1 \
+            -x RDMAV_FORK_SAFE=1 --mca pml ^cm \
             --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
             --bind-to none --tag-output --hostfile hosts ~/aws-ofi-nccl/install/bin/nccl_message_transfer
         set +x
@@ -568,7 +578,7 @@ EOF
         -x RDMAV_FORK_SAFE=1 \
         -x NCCL_DEBUG=INFO \
         -n $NUM_GPUS -N 8 \
-        --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 \
+        --mca btl tcp,self --mca btl_tcp_if_exclude lo,docker0 --mca pml ^cm \
         --bind-to none $HOME/nccl-tests/build/all_reduce_perf -b 8 -e 1G -f 2 -g 1 -c 1 -n 100
     set +x
 EOF

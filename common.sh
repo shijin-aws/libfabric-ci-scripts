@@ -65,6 +65,20 @@ get_ubuntu_1804_ami_id() {
     return $?
 }
 
+get_ubuntu_2004_ami_id() {
+    region=$1
+    if [ "$ami_arch" = "x86_64" ]; then
+        ami_arch_label="amd64"
+    elif [ "$ami_arch" = "aarch64" ]; then
+        ami_arch_label="arm64"
+    fi
+    aws ec2 describe-images --owners 099720109477 \
+        --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-focal-20.04-${ami_arch_label}-server-????????" \
+        'Name=state,Values=available' 'Name=ena-support,Values=true' \
+        --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
+    return $?
+}
+
 get_centos7_ami_id() {
     region=$1
     if [ "$ami_arch" = "x86_64" ]; then
@@ -74,6 +88,19 @@ get_centos7_ami_id() {
     fi
     aws ec2 describe-images --owners 125523088429 \
         --filters "Name=name,Values=CentOS 7*${ami_arch_label}*" 'Name=ena-support,Values=true' \
+        --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
+    return $?
+}
+
+get_centos8_ami_id() {
+    region=$1
+    if [ "$ami_arch" = "x86_64" ]; then
+        ami_arch_label="x86_64"
+    elif [ "$ami_arch" = "aarch64" ]; then
+        ami_arch_label="aarch64"
+    fi
+    aws ec2 describe-images --owners 125523088429 \
+        --filters "Name=name,Values=CentOS 8*${ami_arch_label}*" 'Name=ena-support,Values=true' \
         --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
     return $?
 }
@@ -113,6 +140,34 @@ get_rhel78_ami_id() {
             'Name=state,Values=available' 'Name=ena-support,Values=true' \
             --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
     fi
+    return $?
+}
+
+get_rhel82_ami_id() {
+    region=$1
+    if [ "$ami_arch" = "x86_64" ]; then
+        ami_arch_label="x86_64"
+    elif [ "$ami_arch" = "aarch64" ]; then
+        ami_arch_label="arm64"
+    fi
+    aws ec2 describe-images --owners 309956199498 \
+        --filters "Name=name,Values=RHEL-8.2*${ami_arch_label}*" \
+        'Name=state,Values=available' 'Name=ena-support,Values=true' \
+        --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
+    return $?
+}
+
+get_rhel83_ami_id() {
+    region=$1
+    if [ "$ami_arch" = "x86_64" ]; then
+        ami_arch_label="x86_64"
+    elif [ "$ami_arch" = "aarch64" ]; then
+        ami_arch_label="arm64"
+    fi
+    aws ec2 describe-images --owners 309956199498 \
+        --filters "Name=name,Values=RHEL-8.3*${ami_arch_label}*" \
+        'Name=state,Values=available' 'Name=ena-support,Values=true' \
+        --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
     return $?
 }
 
@@ -329,7 +384,6 @@ EOF
 alinux_install_deps() {
     cat <<-"EOF" >> ${tmp_script}
     sudo yum -y groupinstall 'Development Tools'
-    sudo yum -y install cmake gcc libnl3-devel libudev-devel make pkgconfig
 EOF
 }
 
@@ -341,14 +395,13 @@ EOF
 }
 
 rhel_install_deps() {
-    # Optional and extras needed for rdma-core build
     cat <<-"EOF" >> ${tmp_script}
     sudo yum -y groupinstall 'Development Tools'
-    sudo yum-config-manager --enable rhel-7-server-rhui-optional-rpms
-    # An update after enabling the rhui optional repository seems to be needed
-    # to refresh the CA certs.
-    sudo yum update -y
-    sudo yum -y install cmake gcc libnl3-devel libudev-devel make pkgconfig
+    # python is needed for running fabtests,
+    # which is not available on base rhel8 ami.
+    if [ ! $(which python) ] && [ ! $(which python2) ] && [ ! $(which python3) ]; then
+        sudo yum install -y python3
+    fi
 EOF
 }
 
@@ -361,7 +414,11 @@ centos_update()
 centos_install_deps() {
     cat <<-"EOF" >> ${tmp_script}
     sudo yum -y groupinstall 'Development Tools'
-    sudo yum -y install cmake gcc libnl3-devel libudev-devel make pkgconfig
+    # python is needed for running fabtests,
+    # which is not available on base centos8 ami.
+    if [ ! $(which python) ] && [ ! $(which python2) ] && [ ! $(which python3) ]; then
+        sudo yum install -y python3
+    fi
 EOF
 }
 
@@ -379,7 +436,8 @@ ubuntu_install_deps()
     sudo DEBIAN_FRONTEND=noninteractive apt -y install autoconf
     sudo DEBIAN_FRONTEND=noninteractive apt -y install libltdl-dev
     sudo DEBIAN_FRONTEND=noninteractive apt -y install make
-    sudo DEBIAN_FRONTEND=noninteractive apt -y install build-essential cmake gcc libudev-dev libnl-3-dev libnl-route-3-dev ninja-build pkg-config valgrind python3-dev cython3
+    sudo DEBIAN_FRONTEND=noninteractive apt -y install gcc
+    sudo DEBIAN_FRONTEND=noninteractive apt -y install g++
 EOF
 }
 

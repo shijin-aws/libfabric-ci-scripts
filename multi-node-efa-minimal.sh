@@ -40,6 +40,8 @@ efa_software_components_minimal()
     fi
     if [[ $TEST_SKIP_KMOD -eq 1 ]]; then
         echo "sudo ./efa_installer.sh -k -m -y" >> ${tmp_script}
+    elif [ ${BUILD_GDR} -eq 1 ]; then
+        echo "sudo ./efa_installer.sh -g -m -y" >> ${tmp_script}
     else
         echo "sudo ./efa_installer.sh -m -y" >> ${tmp_script}
     fi
@@ -50,6 +52,9 @@ multi_node_efa_minimal_script_builder()
     type=$1
     set_var
     ${label}_update
+    if [ $BUILD_GDR -eq 1 ]; then
+        cat install-nvidia-driver.sh >> ${tmp_script}
+    fi
     efa_software_components_minimal
 
     # Ubuntu disallows non-child process ptrace by default, which is
@@ -68,6 +73,10 @@ multi_node_efa_minimal_script_builder()
 # copy SSH keys from Jenkins and install libfabric
 install_libfabric()
 {
+    if [ "$BUILD_GDR" -eq 1 ]; then
+        disable_nouveau "$1"
+        test_ssh "$1"
+    fi
     check_provider_os "$1"
     test_ssh "$1"
     set +x
@@ -129,32 +138,10 @@ for IP in ${INSTANCE_IPS[@]}; do
     ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no -T -i ~/${slave_keypair} ${ami[1]}@${IP} \
         "bash --login efa-check.sh --skip-libfabric --skip-mpi" 2>&1 | tr \\r \\n | sed 's/\(.*\)/'$IP' \1/'
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
-        "EFA check after reboot failed on ${IP}"
+        "EFA check failed on ${IP}"
         exit 1
     fi
 done
-
-if [ ${REBOOT_AFTER_INSTALL} -eq 1 ]; then
-    for IP in ${INSTANCE_IPS[@]}; do
-        ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no -T -i ~/${slave_keypair} ${ami[1]}@${IP} \
-            "sudo reboot" 2>&1 | tr \\r \\n | sed 's/\(.*\)/'$IP' \1/'
-    done
-
-    for IP in ${INSTANCE_IPS[@]}; do
-        test_ssh ${IP}
-    done
-
-    # And run the efa-check.sh script again if we rebooted.
-    for IP in ${INSTANCE_IPS[@]}; do
-        echo "Running efa-check.sh on ${IP} after reboot"
-        ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no -T -i ~/${slave_keypair} ${ami[1]}@${IP} \
-            "bash --login efa-check.sh --skip-libfabric --skip-mpi" 2>&1 | tr \\r \\n | sed 's/\(.*\)/'$IP' \1/'
-        if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            "EFA check after reboot failed on ${IP}"
-            exit 1
-        fi
-    done
-fi
 
 # Run MPI tests only for EFA provider for now.
 scp -o ConnectTimeout=30 -o StrictHostKeyChecking=no -i ~/${slave_keypair} \

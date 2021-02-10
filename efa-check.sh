@@ -33,6 +33,14 @@ EOF
         fi_info --version
         echo "EFA libfabric providers:"
         fi_info -p efa
+        if [ "$efa_gdr_enabled" -eq 1 ]; then
+            if ! FI_EFA_USE_DEVICE_RDMA=1 fi_info -p efa -c FI_HMEM; then
+                echo "EFA libfabric provider does not have FI_HMEM capability."
+                return 1
+            else
+                echo "EFA libfabric provider has FI_HMEM capability."
+            fi
+        fi
     fi
 }
 
@@ -101,6 +109,13 @@ if command -v ibv_devices >/dev/null 2>&1; then
     ibv_devices
 fi
 
+efa_gdr_enabled=0
+if sudo modinfo efa | grep gdr | grep -o Y; then
+    echo "EFA kmod has gdr enabled."
+    efa_gdr_enabled=1
+else
+    echo "EFA kmod does not have gdr enabled."
+fi
 echo ""
 echo "======== Configuration check ========"
 # Check for memory lock limit and warn if less than 16GiB. 16GiB is enough for
@@ -116,17 +131,25 @@ EOF
 fi
 echo "Current memory lock limit: $(ulimit -l)"
 
-hugepages=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
-# Check for huge pages. 5128 2MiB huge pages is enough for current Amazon EC2
-# instance types.
-if [ "$hugepages" -lt 5128 ]; then
+huge_pages_size=$(grep "^Hugepagesize:" /proc/meminfo  | awk '{print $2}')
+huge_pages_file="/sys/kernel/mm/hugepages/hugepages-${huge_pages_size}kB/nr_hugepages"
+hugepages=$(cat $huge_pages_file)
+efa_ep_huge_pages_memory=$((110 * 1024)) # convert to kB
+number_of_cores=$(lscpu | grep "^CPU(s):"  | awk '{print $2}')
+efa_total_huge_pages_memory=$(($efa_ep_huge_pages_memory * $number_of_cores))
+efa_number_of_huge_pages=$(($efa_total_huge_pages_memory / $huge_pages_size + 1))
+# For each end point, the libfabric EFA provider will create two packet pools,
+# which is backed by huge page memory. The two packet pools will use 110 MB of
+# memory. We need to reserve at least cores * 110 MB worth of memory in huge
+# pages.
+if [ "$hugepages" -lt $efa_number_of_huge_pages ]; then
     cat >&2 << EOF
 Warning: Configuring huge pages is recommended for the best performance with
 EFA.
 EOF
     ret=1
 fi
-echo "Current number of 2MiB huge pages: $hugepages"
+echo "Current number of $huge_pages_size kB huge pages: $hugepages"
 
 echo ""
 echo "======== Software information ========"

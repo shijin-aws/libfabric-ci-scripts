@@ -15,13 +15,14 @@ fi
 RUN_IMPI_TESTS=${RUN_IMPI_TESTS:-1}
 ENABLE_PLACEMENT_GROUP=${ENABLE_PLACEMENT_GROUP:-0}
 TEST_SKIP_KMOD=${TEST_SKIP_KMOD:-0}
-TEST_GDR=${TEST_GDR:-0}
+BUILD_GDR=${BUILD_GDR:-0}
 
 get_opensuse1502_ami_id() {
     region=$1
     # OpenSUSE does not suppport ARM AMI's
+    # openSUSE-Leap-15.2 Build7.1 cabelo@opensuse.org
     aws ec2 describe-images --owners aws-marketplace \
-        --filters 'Name=name,Values=openSUSE-Leap-15.2-?????????-HVM-x86_64*' 'Name=ena-support,Values=true' \
+        --filters 'Name=product-code,Values=5080kaujzrzibjdwrkruspbj7' 'Name=ena-support,Values=true' \
         --output json --region $region | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
     return $?
 }
@@ -60,7 +61,7 @@ get_alinux2_ami_id() {
     return $?
 }
 
-get_ubuntu_1604_ami_id() {
+get_ubuntu1604_ami_id() {
     region=$1
     if [ "$ami_arch" = "x86_64" ]; then
         ami_arch_label="amd64"
@@ -74,7 +75,7 @@ get_ubuntu_1604_ami_id() {
     return $?
 }
 
-get_ubuntu_1804_ami_id() {
+get_ubuntu1804_ami_id() {
     region=$1
     if [ "$ami_arch" = "x86_64" ]; then
         ami_arch_label="amd64"
@@ -88,7 +89,7 @@ get_ubuntu_1804_ami_id() {
     return $?
 }
 
-get_ubuntu_2004_ami_id() {
+get_ubuntu2004_ami_id() {
     region=$1
     if [ "$ami_arch" = "x86_64" ]; then
         ami_arch_label="amd64"
@@ -227,7 +228,7 @@ create_instance()
                 ami[0]=$(get_rhel76_ami_id $AWS_DEFAULT_REGION)
                 ;;
             ubuntu)
-                ami[0]=$(get_ubuntu_1804_ami_id $AWS_DEFAULT_REGION)
+                ami[0]=$(get_ubuntu1804_ami_id $AWS_DEFAULT_REGION)
                 ;;
             alinux)
                 ami[0]=$(get_alinux2_ami_id $AWS_DEFAULT_REGION)
@@ -261,7 +262,7 @@ create_instance()
     )
     create_instance_count=0
     error=1
-    if [ $ami_arch = "x86_64" ] && [ $TEST_GDR -eq 0 ]; then
+    if [ $ami_arch = "x86_64" ] && [ $BUILD_GDR -eq 0 ]; then
         case "${PROVIDER}" in
             efa)
                 instance_type=c5n.18xlarge
@@ -277,8 +278,8 @@ create_instance()
             *)
                 exit 1
         esac
-    elif [ $TEST_GDR -eq 1 ]; then
-        instance_type=g4dn.metal
+    elif [ $BUILD_GDR -eq 1 ]; then
+        instance_type=p4d.24xlarge
         network_interface="[{\"DeviceIndex\":0,\"DeleteOnTermination\":true,\"InterfaceType\":\"efa\",\"Groups\":[\"${slave_security_group}\"]"
     else
         instance_type=a1.4xlarge
@@ -292,6 +293,11 @@ create_instance()
     fi
     if [[ -n ${USER_DATA_FILE} && -f ${USER_DATA_FILE} ]]; then
         addl_args+=" --user-data file://${USER_DATA_FILE}"
+    fi
+    # NVIDIA drivers and CUDA toolkit are large, allocate more EBS space for them.
+    if [ "$ami_arch" = "x86_64" ]; then
+        dev_name=$(aws ec2 describe-images --image-id ${ami[0]} --query 'Images[*].RootDeviceName' --output text)
+        addl_args="${addl_args} --block-device-mapping=[{\"DeviceName\":\"${dev_name}\",\"Ebs\":{\"VolumeSize\":64}}]"
     fi
 
     echo "==> Creating instances"
@@ -356,6 +362,20 @@ get_instance_ip()
                         --output=text)
 }
 
+# disable nouveau open source driver on instances.
+disable_nouveau()
+{
+    test_ssh $1
+    ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no -T -i ~/${slave_keypair} ${ami[1]}@"$1" \
+        "bash -s" -- < $WORKSPACE/libfabric-ci-scripts/disable-nouveau.sh 2>&1 | tr \\r \\n | sed 's/\(.*\)/'$1' \1/'
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "Disabling nouveau failed on $1"
+        exit 1
+    fi
+    ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no -T -i ~/${slave_keypair} ${ami[1]}@"$1" \
+        "sudo reboot" 2>&1 | tr \\r \\n | sed 's/\(.*\)/'$1' \1/'
+}
+
 # Check provider and OS type, If EFA and Ubuntu then call ubuntu_kernel_upgrade
 check_provider_os()
 {
@@ -373,7 +393,7 @@ check_provider_os()
     if [ ${label} == "suse" ]; then
         test_ssh $1
         ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no -T -i ~/${slave_keypair} ${ami[1]}@"$1" \
-            "sudo zypper --gpg-auto-import-keys refresh -f && sudo zypper update -y && sudo reboot" 2>&1 | tr \\r \\n | sed 's/\(.*\)/'$1' \1/'
+            "sudo zypper --gpg-auto-import-keys refresh -f && sudo zypper update -y && sudo pip install lxml --upgrade && sudo reboot" 2>&1 | tr \\r \\n | sed 's/\(.*\)/'$1' \1/'
     fi
 }
 #Test SLES15SP2 with allow unsupported modules
@@ -394,6 +414,10 @@ script_builder()
     type=$1
     set_var
     ${label}_update
+    if [ $BUILD_GDR -eq 1 ]; then
+        cat install-nvidia-driver.sh >> ${tmp_script}
+        cat install-nvidia-fabric-manager.sh >> ${tmp_script}
+    fi
     efa_software_components
 
     # The libfabric shm provider use CMA for communication. By default ubuntu
@@ -408,6 +432,15 @@ script_builder()
     fi
 
     ${label}_install_deps
+    # install CUDA toolkit only for non-gdr test on x86_64 platform.
+    if [ "$ami_arch" = "x86_64" ] && [ "$BUILD_GDR" -eq 0 ]; then
+        cat <<-"EOF" >> ${tmp_script}
+        curl -O https://developer.download.nvidia.com/compute/cuda/11.0.3/local_installers/cuda_11.0.3_450.51.06_linux.run
+        chmod +x cuda_11.0.3_450.51.06_linux.run
+        sudo ./cuda_11.0.3_450.51.06_linux.run --silent --toolkit
+        sudo ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so
+EOF
+    fi
     if [ -n "$LIBFABRIC_INSTALL_PATH" ]; then
         echo "LIBFABRIC_INSTALL_PATH=$LIBFABRIC_INSTALL_PATH" >> ${tmp_script}
     elif [ ${TARGET_BRANCH} == "v1.8.x" ]; then
@@ -424,6 +457,11 @@ script_builder()
     fi
 
     cat install-fabtests.sh >> ${tmp_script}
+    if [ $BUILD_GDR -eq 1 ]; then
+        cat install-nccl.sh >> ${tmp_script}
+        cat install-aws-ofi-nccl.sh >> ${tmp_script}
+        cat install-nccl-tests.sh >> ${tmp_script}
+    fi
 }
 
 alinux_update()
@@ -449,6 +487,7 @@ EOF
 rhel_install_deps() {
     cat <<-"EOF" >> ${tmp_script}
     sudo yum -y groupinstall 'Development Tools'
+    sudo yum -y install gcc-gfortran
     # python is needed for running fabtests,
     # which is not available on base rhel8 ami.
     if [ ! $(which python) ] && [ ! $(which python2) ] && [ ! $(which python3) ]; then
@@ -466,6 +505,7 @@ centos_update()
 centos_install_deps() {
     cat <<-"EOF" >> ${tmp_script}
     sudo yum -y groupinstall 'Development Tools'
+    sudo yum -y install gcc-gfortran
     # python is needed for running fabtests,
     # which is not available on base centos8 ami.
     if [ ! $(which python) ] && [ ! $(which python2) ] && [ ! $(which python3) ]; then
@@ -490,6 +530,7 @@ ubuntu_install_deps()
     sudo DEBIAN_FRONTEND=noninteractive apt -y install make
     sudo DEBIAN_FRONTEND=noninteractive apt -y install gcc
     sudo DEBIAN_FRONTEND=noninteractive apt -y install g++
+    sudo DEBIAN_FRONTEND=noninteractive apt -y install gfortran
 EOF
 }
 suse_update()
@@ -506,6 +547,7 @@ suse_install_deps() {
     sudo zypper install -y git-core
     sudo zypper install -y wget
     sudo zypper install -y gcc-c++
+    sudo zypper install -y gcc-fortran
 EOF
 }
 
@@ -564,7 +606,7 @@ EOF
     fi
     if [ $TEST_SKIP_KMOD -eq 1 ]; then
         echo "sudo ./efa_installer.sh -y -k" >> ${tmp_script}
-    elif [ $TEST_GDR -eq 1 ]; then
+    elif [ $BUILD_GDR -eq 1 ]; then
         echo "sudo ./efa_installer.sh -y -g" >> ${tmp_script}
     else
         echo "sudo ./efa_installer.sh -y" >> ${tmp_script}
@@ -631,6 +673,10 @@ split_files()
         mv temp_execute_ring_c_impi.txt ${execution_seq}_${INSTANCE_IPS[0]}_ring_c_impi.txt
         execution_seq=$((${execution_seq}+1))
         mv temp_execute_osu_impi.txt ${execution_seq}_${INSTANCE_IPS[0]}_osu_impi.txt
+    fi
+    if [ ${BUILD_GDR} -eq 1 ]; then
+        execution_seq=$((${execution_seq}+1))
+        mv temp_execute_nccl_tests.txt ${execution_seq}_${INSTANCE_IPS[0]}_nccl_tests.txt
     fi
     popd
 }
